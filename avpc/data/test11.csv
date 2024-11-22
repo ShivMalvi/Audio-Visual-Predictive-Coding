@@ -1,5 +1,4 @@
-audio_path	video_path	label	duration
-/Datasets/MUSIC/solo_11classes/audio_wav/xylophone/mPr_SvnJ_z0.wav	/Datasets/MUSIC/solo_11classes/visual/xylophone/mPr_SvnJ_z0.mp4	3	3020
+/Datasets/MUSIC/solo_11classes/audio_wav/xylophone/mPr_SvnJ_z0.wav,/Datasets/MUSIC/solo_11classes/visual/xylophone/mPr_SvnJ_z0.mp4	3	3020
 /Datasets/MUSIC/solo_11classes/audio_wav/saxophone/St-z3WhCuSc.wav	/Datasets/MUSIC/solo_11classes/visual/saxophone/St-z3WhCuSc.mp4	4	4012
 /Datasets/MUSIC/solo_11classes/audio_wav/flute/LI3wIHFQkAk.wav	/Datasets/MUSIC/solo_11classes/visual/flute/LI3wIHFQkAk.mp4	0	1838
 /Datasets/MUSIC/solo_11classes/audio_wav/violin/0jXXWBt5URw.wav	/Datasets/MUSIC/solo_11classes/visual/violin/0jXXWBt5URw.mp4	1	2807
