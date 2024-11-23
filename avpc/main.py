@@ -9,7 +9,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from arguments import ArgParser
-from dataset import MUSICMixDataset
+from datasets.music import MUSICMixDataset
 from models import ModelBuilder, activate
 from utils import AverageMeter, warpgrid, makedirs, output_visuals, calc_metrics, plot_loss_metrics
 
@@ -54,8 +54,8 @@ def main():
     args.best_sdr = -float("inf")
 
     args.world_size = args.num_gpus * args.nodes
-    os.environ['MASTER_ADDR'] = 'xxx.xx.xx.xx'  # specified by yourself
-    os.environ['MASTER_PORT'] = 'xxxx'  # specified by yourself
+    os.environ['MASTER_ADDR'] = '127.0.0.1'  # specified by yourself
+    os.environ['MASTER_PORT'] = '12345'  # specified by yourself
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_ids
     mp.spawn(main_worker, nprocs=args.num_gpus, args=(args,))
@@ -63,8 +63,9 @@ def main():
 
 def main_worker(gpu, args):
     rank = args.nr * args.num_gpus + gpu
-    dist.init_process_group(backend='nccl', init_method='env://', world_size=args.world_size, rank=rank)
-
+    dist.init_process_group(
+    backend='gloo', init_method='env://', world_size=args.world_size, rank=rank
+)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
