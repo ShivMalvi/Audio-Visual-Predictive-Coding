@@ -279,6 +279,35 @@ def save_audio(path, audio_numpy, sr):
 
 # Visualize predictions
 def output_visuals(batch_data, outputs, args):
+    print("[DEBUG] Entering `output_visuals`...")
+    save_path = os.path.join(args.vis, 'batch_visuals')
+    os.makedirs(save_path, exist_ok=True)
+
+    for i, (mag_mix, pred_mask, gt_mask) in enumerate(
+        zip(outputs['mag_mix'], outputs['pred_masks'], outputs['gt_masks'])):
+        print(f"[DEBUG] Visualizing sample {i}...")
+        try:
+            plt.figure(figsize=(12, 4))
+            plt.subplot(1, 3, 1)
+            plt.imshow(mag_mix.cpu().numpy(), aspect='auto', origin='lower')
+            plt.title("Input Mixture")
+
+            plt.subplot(1, 3, 2)
+            plt.imshow(pred_mask[0].cpu().numpy(), aspect='auto', origin='lower')
+            plt.title("Predicted Mask")
+
+            plt.subplot(1, 3, 3)
+            plt.imshow(gt_mask[0].cpu().numpy(), aspect='auto', origin='lower')
+            plt.title("Ground Truth Mask")
+
+            save_file = os.path.join(save_path, f'visual_{i}.png')
+            plt.savefig(save_file)
+            plt.close()
+            print(f"[DEBUG] Saved visualization for sample {i} at {save_file}")
+        except Exception as e:
+            print(f"[ERROR] Failed to save visualization for sample {i}: {e}")
+            
+
     # fetch data and predictions
     mag_mix = batch_data['mag_mix']
     phase_mix = batch_data['phase_mix']
