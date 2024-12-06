@@ -55,32 +55,74 @@ def main():
 
     args.world_size = args.num_gpus * args.nodes
     os.environ['MASTER_ADDR'] = '127.0.0.1'  # specified by yourself
-    os.environ['MASTER_PORT'] = '12345'  # specified by yourself
+    os.environ['MASTER_PORT'] = '29500'  # specified by yourself
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_ids
     mp.spawn(main_worker, nprocs=args.num_gpus, args=(args,))
 
+    # Manual checkpoint saving
+    if args.mode == 'save_checkpoint':
+      print("Manually saving checkpoint...")
+      builder = ModelBuilder()
+      net_frame = builder.build_frame(
+          arch=args.arch_frame,
+          fc_vis=args.n_fm_visual,
+          weights=args.weights_frame)
+      net_sound = builder.build_sound(
+          arch=args.arch_sound,
+          cyc_in=args.cycles_inner,
+          fc_vis=args.n_fm_visual,
+          n_fm_out=args.n_fm_out)
+
+      # Save the checkpoints
+      checkpoint(net_frame, net_sound, args.ckpt)
+      print(f"Checkpoint manually saved to {args.ckpt}.")
+      return
+
+    # Training or other modes (CUDA initialization happens here)
+    mp.spawn(main_worker, nprocs=args.num_gpus, args=(args,))
+
+
+
+
+    
 
 def main_worker(gpu, args):
     rank = args.nr * args.num_gpus + gpu
     dist.init_process_group(
-    backend='gloo', init_method='env://', world_size=args.world_size, rank=rank
-)
+        backend='gloo', init_method='env://', world_size=args.world_size, rank=rank
+    )
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    # network builders
+
+    # Network builders
     builder = ModelBuilder()
     net_frame = builder.build_frame(
         arch=args.arch_frame,
         fc_vis=args.n_fm_visual,
-        weights=args.weights_frame)
+        weights=args.weights_frame
+    )
     net_sound = builder.build_sound(
         arch=args.arch_sound,
         weights=args.weights_sound,
         cyc_in=args.cycles_inner,
         fc_vis=args.n_fm_visual,
-        n_fm_out=args.n_fm_out)
+        n_fm_out=args.n_fm_out
+    )
+
+    if args.device.type == "cuda":
+        torch.cuda.set_device(gpu)
+        net_frame.cuda(gpu)
+        net_sound.cuda(gpu)
+
+    # Wrap the models for Distributed Data Parallel if CUDA is available
+    if args.device.type == "cuda":
+        netWrapper = NetWrapper(net_frame, net_sound, crit_mask).to(args.device)
+        netWrapper = torch.nn.parallel.DistributedDataParallel(netWrapper, device_ids=[gpu])
+    else:
+        netWrapper = NetWrapper(net_frame, net_sound, crit_mask).to(args.device)
+
 
     if gpu == 0:
         # count number of parameters
@@ -97,10 +139,7 @@ def main_worker(gpu, args):
     net_frame.cuda(gpu)
     net_sound.cuda(gpu)
 
-    # wrap model
-    netWrapper = NetWrapper(net_frame, net_sound, crit_mask)
-    netWrapper = torch.nn.parallel.DistributedDataParallel(netWrapper, device_ids=[gpu])
-    netWrapper.to(args.device)
+    
 
     # set up optimizer
     optimizer = create_optimizer(net_frame, net_sound, args)
@@ -165,17 +204,27 @@ def main_worker(gpu, args):
 
             # save checkpoint and test modal on test set
             cur_sdr = history['val']['sdr'][-1]
+            print(f"Validation SDR: {cur_sdr}, Best SDR so far: {args.best_sdr}")
             if cur_sdr > args.best_sdr:
+                print("New best SDR achieved. Saving checkpoint...")
                 args.best_sdr = cur_sdr
-
                 checkpoint(net_frame, net_sound, args.ckpt)
-                print('Saving checkpoints with the best validation performance at epoch {}.'.format(epoch + 1))
 
                 evaluate_testset(netWrapper, loader_test, epoch + 1, args)
+
+        # Ensure checkpoint directory exists
+        if not os.path.exists(args.ckpt):
+            print(f"Checkpoint directory '{args.ckpt}' does not exist. Creating it...")
+            os.makedirs(args.ckpt)
+        else:
+            print(f"Checkpoint directory '{args.ckpt}' exists.")
 
         # adjust learning rate
         if epoch + 1 in args.lr_steps:
             adjust_learning_rate(optimizer, args)
+    print("Manually saving checkpoint at the end of training...")
+    checkpoint(net_frame, net_sound, args.ckpt)
+    print("Manual checkpoint save complete.")
 
     if gpu == 0:
         print('\nTraining Done!')
@@ -336,25 +385,26 @@ def evaluate(netWrapper, loader, history, epoch, args):
                 print('[Eval] iter {}, loss: {:.4f}'.format(i, err.item()))
     
             # calculate metrics
-            sdr_mix, sdr, sir, sar, cur_valid_num = calc_metrics(batch_data, outputs, args)
+            sdr_mix, sdr, sir, sar, valid_num = calc_metrics(batch_data, outputs, args)
             sdr_mix_meter.update(sdr_mix)
             sdr_meter.update(sdr)
             sir_meter.update(sir)
             sar_meter.update(sar)
-            valid_num += cur_valid_num
+            #valid_num += cur_valid_num
     
             # output visualization
             if i == 0:
                 output_visuals(batch_data, outputs, args)
 
-    metric_output = '[Eval Summary] Epoch: {}, Loss: {:.4f}, ' \
-                    'SDR_mixture: {:.4f}, SDR: {:.4f}, SIR: {:.4f}, SAR: {:.4f}'.format(
-        epoch, loss_meter.average(), 
-        sdr_mix_meter.average(), sdr_meter.average(), sir_meter.average(), sar_meter.average())
-    if valid_num / eval_num < 0.8:
-        metric_output += ' ---- Invalid ---- '
+    metric_output = ('[Test Summary] Loss: {:.4f}, '
+                 'SDR_mixture: {:.4f}, SDR: {:.4f}, SIR: {:.4f}, SAR: {:.4f}').format(
+    loss_meter.average(),
+    sdr_mix_meter.average(),
+    sdr_meter.average(),
+    sir_meter.average(),
+    sar_meter.average())
     print(metric_output)
-    
+
     learning_rate = ' lr_sound: {}, lr_frame: {}'.format(args.lr_sound, args.lr_frame)
     with open(args.log, 'a') as F:
         if sdr_meter.average() > args.best_sdr:
@@ -379,12 +429,11 @@ def evaluate(netWrapper, loader, history, epoch, args):
 
 
 def evaluate_testset(netWrapper, loader, epoch, args):
-    print('=========================Test at epoch {}========================='.format(epoch))
+    print(f"=========================Test at epoch {epoch}=========================")
     torch.set_grad_enabled(False)
-    
     netWrapper.eval()
 
-    # initialize meters
+    # Initialize metrics
     loss_meter = AverageMeter()
     sdr_mix_meter = AverageMeter()
     sdr_meter = AverageMeter()
@@ -395,19 +444,19 @@ def evaluate_testset(netWrapper, loader, epoch, args):
     valid_num = 0
     with torch.no_grad():
         for i, batch_data in enumerate(loader):
-            
             eval_num += batch_data['mag_mix'].shape[0]
-            
+
+            # Forward pass
             err_mask, outputs = netWrapper.forward(batch_data, args)
             err = err_mask.mean()
-    
-            loss_meter.update(err.item())
 
-            total_batch = (11 * args.dup_testset // args.batch_size_val_test)
-            if i == 0 or (i + 1) == (total_batch // 2) or (i + 1) == total_batch:
-                print('[Eval] iter {}, loss: {:.4f}'.format(i, err.item()))
-    
-            # calculate metrics
+            loss_meter.update(err.item())
+            if i == 0:
+              print(f"Saving visualizations for batch {i}...")
+              output_visuals(batch_data, outputs, args)
+              print(f'[Test] iter {i}, loss: {err.item()}')
+
+            # Calculate metrics
             sdr_mix, sdr, sir, sar, cur_valid_num = calc_metrics(batch_data, outputs, args)
             sdr_mix_meter.update(sdr_mix)
             sdr_meter.update(sdr)
@@ -415,22 +464,59 @@ def evaluate_testset(netWrapper, loader, epoch, args):
             sar_meter.update(sar)
             valid_num += cur_valid_num
 
-            # # output visualization
-            # if i == 0:
-            #     output_visuals(batch_data, outputs, args)
-
-    metric_output = '[Test Summary] Epoch: {}, Loss: {:.4f}, ' \
-                    'SDR_mixture: {:.4f}, SDR: {:.4f}, SIR: {:.4f}, SAR: {:.4f}'.format(
-        epoch, loss_meter.average(),
-        sdr_mix_meter.average(), sdr_meter.average(), sir_meter.average(), sar_meter.average())
+    # Log metrics
+    metric_output = (f'[Test Summary] Epoch: {epoch}, Loss: {loss_meter.average():.4f}, '
+                     f'SDR: {sdr_meter.average():.4f}, SIR: {sir_meter.average():.4f}, SAR: {sar_meter.average():.4f}')
     if valid_num / eval_num < 0.8:
         metric_output += ' ---- Invalid ---- '
     print(metric_output)
-    
-    with open(args.log, 'a') as F:
-        F.write(metric_output + '************************\n')
 
-    print('=========================Test finished!=========================')
+    log_file = os.path.join(args.ckpt, 'running_log.txt')
+    with open(log_file, 'a') as f:
+        f.write(metric_output + '\n')
+
+
+    # Example usage of output_visuals during evaluation
+    if args.mode == 'test':
+      for i, batch_data in enumerate(loader_test):
+          err_mask, outputs = netWrapper.forward(batch_data, args)
+          # Generate visualizations for all or specific batches
+          if i == 0:  # You can change this condition to generate for all batches
+              output_visuals(batch_data, outputs, args)
+
+    print('=========================Test Finished!=========================')
+
+
+def output_visuals(batch_data, outputs, args, save_dir='visualization'):
+    print("Saving visualization files...")
+    save_path = os.path.join(args.ckpt, save_dir)
+    os.makedirs(save_path, exist_ok=True)
+
+    for i, (mag_mix, pred_mask, gt_mask) in enumerate(
+        zip(outputs['mag_mix'], outputs['pred_masks'], outputs['gt_masks'])):
+      try:
+        fig, ax = plt.subplots(1, 3, figsize=(12, 4))
+        ax[0].imshow(mag_mix.cpu().numpy(), aspect='auto', origin='lower')
+        ax[0].set_title("Input Mixture")
+
+        ax[1].imshow(pred_mask[0].cpu().numpy(), aspect='auto', origin='lower')
+        ax[1].set_title("Predicted Mask")
+
+        ax[2].imshow(gt_mask[0].cpu().numpy(), aspect='auto', origin='lower')
+        ax[2].set_title("Ground Truth Mask")
+
+        plt.tight_layout()
+        save_file = os.path.join(save_path, f'visual_{i}.png')
+        plt.savefig(save_file)
+        plt.close(fig)
+        print(f"[DEBUG] Saved visualization for sample {i} at {save_file}")
+
+      except Exception as e:
+        print(f"[ERROR] Failed to save visualization for sample {i}: {e}")
+
+
+
+
 
 
 def create_optimizer(net_frame, net_sound, args):
@@ -452,8 +538,16 @@ def create_optimizer(net_frame, net_sound, args):
 
 
 def checkpoint(net_frame, net_sound, save_path):
-    torch.save(net_frame.state_dict(), '{}/frame_best.pth'.format(save_path))
-    torch.save(net_sound.state_dict(), '{}/sound_best.pth'.format(save_path))
+    print(f"Saving checkpoint to {save_path}...")
+    os.makedirs(save_path, exist_ok=True)  # Ensure the directory exists
+    frame_path = os.path.join(save_path, "frame_best.pth")
+    sound_path = os.path.join(save_path, "sound_best.pth")
+    try:
+        torch.save(net_frame.state_dict(), frame_path)
+        torch.save(net_sound.state_dict(), sound_path)
+        print(f"Checkpoint saved successfully: {frame_path}, {sound_path}")
+    except Exception as e:
+        print(f"Error saving checkpoint: {e}")
 
 
 def adjust_learning_rate(optimizer, args):
