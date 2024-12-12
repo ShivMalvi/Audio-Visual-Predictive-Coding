@@ -7,6 +7,7 @@ import random
 import librosa
 import numpy as np
 from PIL import Image
+import os
 
 import torch
 import torchaudio
@@ -42,7 +43,7 @@ class BaseDataset(torchdata.Dataset):
         # initialize video transform
         self._init_vtransform()
 
-        # list_sample can be a python list or a csv file of list
+                # list_sample can be a python list or a csv file of list
         if isinstance(list_sample, str):
             self.list_sample = []
             for row in csv.reader(open(list_sample, 'r'), delimiter=','):
@@ -52,22 +53,29 @@ class BaseDataset(torchdata.Dataset):
         elif isinstance(list_sample, list):
             self.list_sample = list_sample
         else:
-            raise ('Error list_sample!')
+            raise ValueError("Error in list_sample format!")
+            
+            # Print debug info
+            print(f"[DEBUG] Process stage: {process_stage}")
+            print(f"[DEBUG] Initial samples in {list_sample}: {len(self.list_sample)}")
 
-        if self.process_stage == 'train':
-            self.list_sample *= opt.dup_trainset
-            random.shuffle(self.list_sample)
-        elif self.process_stage == 'val':
-            self.list_sample *= opt.dup_validset
-        else:
-            self.list_sample *= opt.dup_testset
+            if process_stage == 'train':
+                self.list_sample *= opt.dup_trainset
+                random.shuffle(self.list_sample)
+            elif process_stage == 'val':
+                self.list_sample *= opt.dup_validset
+            else:
+                self.list_sample *= opt.dup_testset
 
-        if max_sample > 0:
-            self.list_sample = self.list_sample[0:max_sample]
+            if max_sample > 0:
+                self.list_sample = self.list_sample[:max_sample]
 
-        num_sample = len(self.list_sample)
-        assert num_sample > 0
-        print('# samples: {}'.format(num_sample))
+            num_sample = len(self.list_sample)
+            print(f"[DEBUG] Number of samples after duplication and max_sample: {num_sample}")
+            if num_sample == 0:
+                raise AssertionError("No valid samples found in the dataset.")
+
+    # Rest of the __init__ code...
 
     def __len__(self):
         return len(self.list_sample)
@@ -107,7 +115,11 @@ class BaseDataset(torchdata.Dataset):
         amp = np.abs(spec)
         phase = np.angle(spec)
         return torch.from_numpy(amp), torch.from_numpy(phase)
-
+   
+   
+   
+   
+    '''
     def _load_audio(self, path, start_timestamp, nearest_resample=False):
 
         # silent
@@ -148,7 +160,82 @@ class BaseDataset(torchdata.Dataset):
         else:
             audio_raw, rate = librosa.load(path, sr=self.audRate, mono=True)
 
+        return audio_raw, rate 
+    '''
+
+    def _load_audio(self, path, start_timestamp, nearest_resample=False):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Audio path does not exist: {path}")
+
+        if path.endswith('silent'):
+            return np.zeros(self.audLen, dtype=np.float32)
+
+        # Load audio
+        try:
+            audio_raw, rate = self._load_audio_file(path)
+        except Exception as e:
+            print(f"Error loading audio from {path}: {e}")
+            return np.zeros(self.audLen, dtype=np.float32)
+
+        # Repeat if audio is too short
+        if audio_raw.shape[0] < rate * self.audSec:
+            n = int(rate * self.audSec / audio_raw.shape[0]) + 1
+            audio_raw = np.tile(audio_raw, n)
+
+        # Resample if needed
+        if rate > self.audRate:
+            if nearest_resample:
+                audio_raw = audio_raw[::rate // self.audRate]
+            else:
+                audio_raw = librosa.resample(audio_raw, orig_sr=rate, target_sr=self.audRate)
+
+        # Audio clip
+        start = int(start_timestamp * self.audRate)
+        end = start + self.audLen
+
+        if end > len(audio_raw):
+            end = len(audio_raw)
+            start = max(0, end - self.audLen)  # Ensure we still return valid audio
+
+        return audio_raw[start:end]
+
+    def _load_audio_file(self, path):
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"Audio file does not exist: {path}")
+
+        if path.endswith('.mp3'):
+            audio_raw, rate = torchaudio.load(path)
+            audio_raw = audio_raw.numpy().astype(np.float32)
+
+            # Convert to mono
+            if audio_raw.shape[0] == 2:
+                audio_raw = (audio_raw[0, :] + audio_raw[1, :]) / 2
+            else:
+                audio_raw = audio_raw[0, :]
+        else:
+            try:
+                audio_raw, rate = librosa.load(path, sr=self.audRate, mono=True)
+            except Exception as e:
+                raise RuntimeError(f"Failed to load audio file {path}: {e}")
+
         return audio_raw, rate
+
+    def __getitem__(self, index):
+        sample = self.list_sample[index]
+        N = len(sample) // 2
+        paths_audio = sample[0:N]
+        paths_frame = sample[N:]
+        start_clip_sec = random.uniform(0, self.audSec)
+
+        try:
+            audios = [self._load_audio(path, start_clip_sec) for path in paths_audio]
+            frames = self._load_frames(paths_frame)
+            amp_mix, mags, phase_mix = self._mix_n_and_stft(audios)
+        except Exception as e:
+            print(f"Error processing sample at index {index}: {e}")
+            return self.dummy_mix_data(N)
+
+        return amp_mix, mags, frames, audios, phase_mix
 
     def _mix_n_and_stft(self, audios):
         N = len(audios)
