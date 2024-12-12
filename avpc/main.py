@@ -226,7 +226,13 @@ def main_worker(gpu, args):
     checkpoint(net_frame, net_sound, args.ckpt)
     print("Manual checkpoint save complete.")
 
+
+        # Example: Force save checkpoint after training one epoch
     if gpu == 0:
+        print("[DEBUG] Saving checkpoint manually for debugging...")
+        checkpoint(net_frame, net_sound, args.ckpt)
+        print(f"[DEBUG] Checkpoint saved successfully to {args.ckpt}")
+ #  if gpu == 0:
         print('\nTraining Done!')
 
 
@@ -320,12 +326,16 @@ def train(netWrapper, loader, optimizer, history, epoch, gpu, args):
         # forward pass
         netWrapper.zero_grad()
 
+        print(f"[DEBUG] Forward pass at iteration {i}")
         err_mask, _ = netWrapper.forward(batch_data, args)
+        print(f"[DEBUG] Loss calculated: {err_mask.mean().item()}")
+
         err = err_mask.mean()
 
         # backward
         err.backward()
         optimizer.step()
+        print(f"[DEBUG] Backward pass completed at iteration {i}")
 
         # measure total time
         torch.cuda.synchronize()
@@ -491,9 +501,11 @@ def output_visuals(batch_data, outputs, args, save_dir='visualization'):
     print("Saving visualization files...")
     save_path = os.path.join(args.ckpt, save_dir)
     os.makedirs(save_path, exist_ok=True)
+    print(f"[DEBUG] Output directory: {save_path}")
 
     for i, (mag_mix, pred_mask, gt_mask) in enumerate(
         zip(outputs['mag_mix'], outputs['pred_masks'], outputs['gt_masks'])):
+        
       try:
         fig, ax = plt.subplots(1, 3, figsize=(12, 4))
         ax[0].imshow(mag_mix.cpu().numpy(), aspect='auto', origin='lower')
@@ -513,7 +525,10 @@ def output_visuals(batch_data, outputs, args, save_dir='visualization'):
 
       except Exception as e:
         print(f"[ERROR] Failed to save visualization for sample {i}: {e}")
-
+    
+    if args.visualize:
+      print("[INFO] Visualization enabled.")
+      output_visuals(batch_data, outputs, args, save_dir='visualization')
 
 
 
@@ -537,18 +552,28 @@ def create_optimizer(net_frame, net_sound, args):
     return torch.optim.AdamW(param_groups, betas=(args.beta1, 0.999), weight_decay=args.weight_decay)
 
 
-def checkpoint(net_frame, net_sound, save_path):
-    print(f"Saving checkpoint to {save_path}...")
-    os.makedirs(save_path, exist_ok=True)  # Ensure the directory exists
-    frame_path = os.path.join(save_path, "frame_best.pth")
-    sound_path = os.path.join(save_path, "sound_best.pth")
+def checkpoint(net_frame, net_sound, save_path, epoch=None):
+    print(f"[DEBUG] Saving checkpoint to {save_path}...")
+    os.makedirs(save_path, exist_ok=True)
     try:
+        frame_path = os.path.join(save_path, "frame_best.pth")
+        sound_path = os.path.join(save_path, "sound_best.pth")
         torch.save(net_frame.state_dict(), frame_path)
         torch.save(net_sound.state_dict(), sound_path)
-        print(f"Checkpoint saved successfully: {frame_path}, {sound_path}")
+        print(f"[DEBUG] Checkpoint saved: {frame_path}, {sound_path}")
+        if epoch is not None:
+            epoch_dir = os.path.join(save_path, "epoch_checkpoints")
+            os.makedirs(epoch_dir, exist_ok=True)
+            epoch_frame_path = os.path.join(epoch_dir, f"frame_epoch_{epoch}.pth")
+            epoch_sound_path = os.path.join(epoch_dir, f"sound_epoch_{epoch}.pth")
+            torch.save(net_frame.state_dict(), epoch_frame_path)
+            torch.save(net_sound.state_dict(), epoch_sound_path)
+            print(f"[DEBUG] Epoch checkpoint saved: {epoch_frame_path}, {epoch_sound_path}")
     except Exception as e:
-        print(f"Error saving checkpoint: {e}")
+        print(f"[ERROR] Checkpoint saving failed: {e}")
 
+
+        
 
 def adjust_learning_rate(optimizer, args):
     args.lr_sound *= 0.1
