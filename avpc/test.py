@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from arguments import ArgParser
 from arguments_test import ArgParserTest
 from datasets.music import MUSICMixDataset
 from models import ModelBuilder, activate
@@ -21,21 +22,39 @@ def main():
     args = parser.parse_test_arguments()
     args.batch_size = args.num_gpus * args.batch_size_per_gpu
 
+    # Validate GPU IDs
+    available_gpus = torch.cuda.device_count()
+    specified_gpus = list(map(int, args.gpu_ids.split(",")))
+
+    if max(specified_gpus) >= available_gpus:
+        print(f"[ERROR] Specified GPU IDs {args.gpu_ids} exceed available GPUs (count: {available_gpus}).")
+        args.gpu_ids = "0"  # Fallback to the first available GPU
+        args.num_gpus = 1
+        print(f"[INFO] Defaulting to GPU ID: {args.gpu_ids}")
+    
+    # Device configuration
     if torch.cuda.is_available():
         args.device = torch.device("cuda")
+        print(f"[INFO] Using GPU(s): {args.gpu_ids}")
     else:
         args.device = torch.device("cpu")
+        args.gpu_ids = "-1"
+        args.num_gpus = 0
+        print("[INFO] CUDA not available. Running on CPU.")
 
     args.vis = os.path.join(args.ckpt, 'visualization/')
     args.log = os.path.join(args.ckpt, 'test_log.txt')
 
     args.world_size = args.num_gpus * args.nodes
-    os.environ['MASTER_ADDR'] = '127.0.0.1'   # specified by yourself
-    os.environ['MASTER_PORT'] = '29500'   # specified by yourself
+    os.environ['MASTER_ADDR'] = '127.0.0.1'
+    os.environ['MASTER_PORT'] = '29500'
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_ids
+
     mp.spawn(main_worker, nprocs=args.num_gpus, args=(args,))
 
+
+    
 
 def main_worker(gpu, args):
     rank = args.nr * args.num_gpus + gpu
@@ -199,75 +218,99 @@ class NetWrapper(torch.nn.Module):
 def evaluate(netWrapper, loader, args):
     torch.set_grad_enabled(False)
 
-    # remove previous viz results
+    # Remove previous visualization results
     makedirs(args.vis, remove=True)
     print("\n--- Visualization Directory Content ---")
     print(os.listdir(args.vis))
 
-    # switch to eval mode
+    # Switch to eval mode
     netWrapper.eval()
 
-    # initialize meters
+    # Initialize meters
     loss_meter = AverageMeter()
     sdr_mix_meter = AverageMeter()
     sdr_meter = AverageMeter()
     sir_meter = AverageMeter()
     sar_meter = AverageMeter()
 
-    with torch.no_grad():
-        for i, batch_data in enumerate(loader):
-
-            err_mask, outputs = netWrapper.forward(batch_data, args)
-            err = err_mask.mean()
-
-            loss_meter.update(err.item())
-
-            total_batch = (11 * args.dup_testset // args.batch_size_val_test)
-            if i == 0 or (i + 1) == (total_batch // 2) or (i + 1) == total_batch:
-                print('[Eval] iter {}, loss: {:.4f}'.format(i, err.item()))
-
-            # calculate metrics
-            sdr_mix, sdr, sir, sar, valid_num = calc_metrics(batch_data, outputs, args)
-            sdr_mix_meter.update(sdr_mix)
-            sdr_meter.update(sdr)
-            sir_meter.update(sir)
-            sar_meter.update(sar)
-            
-            
-           # Calculate metrics for all batches and log them
+    try:
+        with torch.no_grad():
             for i, batch_data in enumerate(loader):
-              ...
-              # Log metrics to `test_log.txt` after every batch
-              args.log = os.path.join(args.ckpt, 'test_log.txt')
-              with open(args.log, 'a') as f:
-                  f.write(f"[Batch {i}] SDR_mix: {sdr_mix:.4f}, SDR: {sdr:.4f}, SIR: {sir:.4f}, SAR: {sar:.4f}, Valid: {valid_num}\n")
-                  F.write("[Test Completed]\n")
-                  F.write(metric_output + '\n')
+                # Forward pass
+                err_mask, outputs = netWrapper.forward(batch_data, args)
+                err = err_mask.mean()
+                loss_meter.update(err.item())
 
+                # Log intermediate loss
+                if i % 10 == 0 or i == len(loader) - 1:
+                    print(f"[Eval] Iter {i}, Loss: {err.item():.4f}")
+                    log_path = os.path.join(args.ckpt, 'test_log.txt')
+                    with open(log_path, 'a') as log_file:
+                        log_file.write(f"[Batch {i}] Loss: {err.item():.4f}\n")
 
-            # output visualization
-            if i == 0:
-              print(f"Generating visualizations for batch {i}...")
-              output_visuals(batch_data, outputs, args)
-            
-metric_output = ('[Test Summary] Loss: {:.4f}, '
-                 'SDR_mixture: {:.4f}, SDR: {:.4f}, SIR: {:.4f}, SAR: {:.4f}').format(
-    loss_meter.average(),
-    sdr_mix_meter.average(),
-    sdr_meter.average(),
-    sir_meter.average(),
-    sar_meter.average())
-print(metric_output)
+                # Calculate metrics
+                sdr_mix, sdr, sir, sar, valid_num = calc_metrics(batch_data, outputs, args)
+                sdr_mix_meter.update(sdr_mix)
+                sdr_meter.update(sdr)
+                sir_meter.update(sir)
+                sar_meter.update(sar)
 
-# Log metrics to file
-log_path = os.path.join(args.ckpt, 'test_log.txt')
-try:
-    with open(log_path, 'a') as log_file:
-        log_file.write(f"[Eval] Batch {i}, Loss: {loss_meter.average():.4f}, "
-                       f"SDR: {sdr_meter.average():.4f}, SIR: {sir_meter.average():.4f}, SAR: {sar_meter.average():.4f}\n")
-    print(f"[DEBUG] Metrics logged for batch {i} in {log_path}")
-except Exception as e:
-    print(f"[ERROR] Failed to log metrics for batch {i}: {e}")  
+                # Visualization
+                if i < 3:  # Generate visualizations for the first 3 batches
+                    print(f"Generating visualizations for batch {i}...")
+                    output_visuals(batch_data, outputs, args)
+
+            # Final metrics
+            metric_output = (
+                f"[Test Summary] Loss: {loss_meter.average():.4f}, "
+                f"SDR_mix: {sdr_mix_meter.average():.4f}, SDR: {sdr_meter.average():.4f}, "
+                f"SIR: {sir_meter.average():.4f}, SAR: {sar_meter.average():.4f}"
+            )
+            print(metric_output)
+
+            # Save final metrics
+            log_path = os.path.join(args.ckpt, 'test_log.txt')
+            with open(log_path, 'a') as log_file:
+                log_file.write(f"{metric_output}\n")
+            print(f"[DEBUG] Metrics logged in {log_path}")
+
+    except Exception as e:
+        print(f"[ERROR] Evaluation failed: {e}")
+
+        
+
+# Ensure `args` is passed correctly in the function and is properly initialized
+def log_metrics(loader, netWrapper, args):
+    """
+    Log evaluation metrics for the test loader.
+    """
+    try:
+        # Set up the log path using args.ckpt
+        log_path = os.path.join(args.ckpt, 'test_log.txt')
+        
+        # Open the log file in append mode
+        with open(log_path, 'a') as log_file:
+            # Iterate through the test loader
+            for i, batch_data in enumerate(loader):
+                # Forward pass to calculate metrics
+                err_mask, outputs = netWrapper.forward(batch_data, args)
+                err = err_mask.mean()
+
+                # Calculate SDR, SIR, SAR, etc.
+                sdr_mix, sdr, sir, sar, valid_num = calc_metrics(batch_data, outputs, args)
+
+                # Log metrics
+                log_file.write(
+                    f"[Eval] Batch {i}, Loss: {err.item():.4f}, "
+                    f"SDR: {sdr:.4f}, SIR: {sir:.4f}, SAR: {sar:.4f}, Valid: {valid_num}\n"
+                )
+
+                print(f"[DEBUG] Metrics logged for batch {i} in {log_path}")
+
+        print("[DEBUG] All metrics logged successfully.")
+    except Exception as e:
+        print(f"[ERROR] Failed to log metrics: {e}")
+
 
 
 if __name__ == '__main__':
