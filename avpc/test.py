@@ -7,7 +7,6 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from arguments import ArgParser
 from arguments_test import ArgParserTest
 from datasets.music import MUSICMixDataset
 from models import ModelBuilder, activate
@@ -17,10 +16,9 @@ warnings.filterwarnings("ignore")
 
 
 def main():
-    # arguments
+    # Parse arguments
     parser = ArgParserTest()
-    args = parser.parse_test_arguments()
-    args.batch_size = args.num_gpus * args.batch_size_per_gpu
+    args = parser.parse_test_arguments()  # Correct method to parse test arguments
 
     # Validate GPU IDs
     available_gpus = torch.cuda.device_count()
@@ -31,8 +29,8 @@ def main():
         args.gpu_ids = "0"  # Fallback to the first available GPU
         args.num_gpus = 1
         print(f"[INFO] Defaulting to GPU ID: {args.gpu_ids}")
-    
-    # Device configuration
+
+    # Set up device configuration
     if torch.cuda.is_available():
         args.device = torch.device("cuda")
         print(f"[INFO] Using GPU(s): {args.gpu_ids}")
@@ -42,19 +40,27 @@ def main():
         args.num_gpus = 0
         print("[INFO] CUDA not available. Running on CPU.")
 
+    # Additional argument setup
     args.vis = os.path.join(args.ckpt, 'visualization/')
     args.log = os.path.join(args.ckpt, 'test_log.txt')
 
+    # World size for distributed processing
+    args.batch_size = args.num_gpus * args.batch_size_per_gpu
     args.world_size = args.num_gpus * args.nodes
+
+    print(f"[INFO] Batch Size: {args.batch_size}")
+    print(f"[INFO] World Size: {args.world_size}")
+
+    # Environment setup for multiprocessing
     os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = '29500'
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_ids
 
+    # Start multiprocessing workers
+    print(f"[INFO] Spawning {args.num_gpus} worker processes...")
     mp.spawn(main_worker, nprocs=args.num_gpus, args=(args,))
 
-
-    
 
 def main_worker(gpu, args):
     rank = args.nr * args.num_gpus + gpu
@@ -63,40 +69,32 @@ def main_worker(gpu, args):
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    # network builders
+    # Network builders
     builder = ModelBuilder()
-    net_frame = builder.build_frame(
-        arch=args.arch_frame,
-        fc_vis=args.n_fm_visual,
-        weights='')
-    net_sound = builder.build_sound(
-        arch=args.arch_sound,
-        weights='',
-        cyc_in=args.cycles_inner,
-        fc_vis=args.n_fm_visual,
-        n_fm_out=args.n_fm_out)
+    net_frame = builder.build_frame(arch=args.arch_frame, fc_vis=args.n_fm_visual, weights='')
+    net_sound = builder.build_sound(arch=args.arch_sound, weights='', cyc_in=args.cycles_inner, fc_vis=args.n_fm_visual, n_fm_out=args.n_fm_out)
 
     if gpu == 0:
-        # count number of parameters
+        # Count number of parameters
         n_params_net_frame = sum(p.numel() for p in net_frame.parameters())
         print('#P of net_frame: {}'.format(n_params_net_frame))
         n_params_net_sound = sum(p.numel() for p in net_sound.parameters())
         print('#P of net_sound: {}'.format(n_params_net_sound))
         print('Total #P: {}'.format(n_params_net_frame + n_params_net_sound))
 
-    # loss function
+    # Loss function
     crit_mask = builder.build_criterion(arch=args.loss)
 
     torch.cuda.set_device(gpu)
     net_frame.cuda(gpu)
     net_sound.cuda(gpu)
 
-    # wrap model
+    # Wrap model
     netWrapper = NetWrapper(net_frame, net_sound, crit_mask)
-    netWrapper = torch.nn.parallel.DistributedDataParallel(netWrapper, device_ids=[gpu])  # , find_unused_parameters=True
+    netWrapper = torch.nn.parallel.DistributedDataParallel(netWrapper, device_ids=[gpu])
     netWrapper.to(args.device)
 
-    # load well-trained model
+    # Load well-trained model
     map_location = {'cuda:%d' % 0: 'cuda:%d' % gpu}
     net_frame.load_state_dict(torch.load(args.weights_frame, map_location=map_location))
     net_sound.load_state_dict(torch.load(args.weights_sound, map_location=map_location))
@@ -104,29 +102,9 @@ def main_worker(gpu, args):
     args.batch_size_ = int(args.batch_size / args.num_gpus)
     args.batch_size_val_test = 30
 
-    # dataset and loader
-    dataset_train = MUSICMixDataset(args.list_train, args, process_stage='train')
-    dataset_val = MUSICMixDataset(args.list_val, args, max_sample=args.num_val, process_stage='val')
-    dataset_test = MUSICMixDataset(args.list_test, args, max_sample=args.num_test, process_stage='test')
+    # Dataset and loader
+    dataset_test = MUSICMixDataset(args.list_test, args, process_stage='test')
 
-    train_sampler = torch.utils.data.distributed.DistributedSampler(dataset_train,
-                                                                    num_replicas=args.world_size,
-                                                                    rank=rank)
-    loader_train = torch.utils.data.DataLoader(
-        dataset_train,
-        batch_size=args.batch_size_,
-        shuffle=False,
-        num_workers=args.workers,
-        pin_memory=True,
-        sampler=train_sampler,
-        drop_last=True)
-    loader_val = torch.utils.data.DataLoader(
-        dataset_val,
-        batch_size=args.batch_size_val_test,
-        shuffle=False,
-        num_workers=args.workers,
-        pin_memory=True,
-        drop_last=False)
     loader_test = torch.utils.data.DataLoader(
         dataset_test,
         batch_size=args.batch_size_val_test,
@@ -136,13 +114,9 @@ def main_worker(gpu, args):
         drop_last=False)
 
     if gpu == 0:
-        args.epoch_iters = len(dataset_train) // args.batch_size
-        print('1 Epoch = {} iters'.format(args.epoch_iters))
-
         evaluate(netWrapper, loader_test, args)
 
 
-# network wrapper, defines forward pass
 class NetWrapper(torch.nn.Module):
     def __init__(self, net_frame, net_sound, crit):
         super(NetWrapper, self).__init__()
@@ -150,69 +124,20 @@ class NetWrapper(torch.nn.Module):
         self.crit = crit
 
     def forward(self, batch_data, args):
-        mag_mix = batch_data['mag_mix']
-        mags = batch_data['mags']
-        frames = batch_data['frames']
-        mag_mix = mag_mix + 1e-10
+        mag_mix = batch_data['mag_mix'].cuda(non_blocking=True)
+        mags = [m.cuda(non_blocking=True) for m in batch_data['mags']]
+        frames = [f.cuda(non_blocking=True) for f in batch_data['frames']]
 
         N = args.num_mix
-        B = mag_mix.size(0)
-        T = mag_mix.size(3)
+        gt_masks = [(m / mag_mix).clamp(0., 5.) for m in mags]
+        feat_map_frames = [self.net_frame.forward_multiframe(f) for f in frames]
 
-        mag_mix = mag_mix.cuda(non_blocking=True)
-        for n in range(N):
-            mags[n] = mags[n].cuda(non_blocking=True)
-            frames[n] = frames[n].cuda(non_blocking=True)
+        pred_masks = [activate(self.net_sound.forward_test_stage(torch.log(mag_mix), f, args.cycs_in_test), args.output_activation) for f in feat_map_frames]
+        err_mask = self.crit(pred_masks, gt_masks, torch.ones_like(mag_mix))
 
-        # 0.0 warp the spectrogram
-        if args.log_freq:
-            grid_warp = torch.from_numpy(
-                warpgrid(B, 256, T, warp=True)).cuda(non_blocking=True)
-            mag_mix = F.grid_sample(mag_mix, grid_warp, align_corners=False)
-            for n in range(N):
-                mags[n] = F.grid_sample(mags[n], grid_warp, align_corners=False)
-
-        # 0.1 calculate loss weighting coefficient: magnitude of input mixture
-        if args.weighted_loss:
-            weight = torch.log1p(mag_mix)
-            weight = torch.clamp(weight, 1e-3, 10)
-        else:
-            weight = torch.ones_like(mag_mix)
-
-        # 0.2 ground truth masks are computed after warpping!
-        gt_masks = [None for n in range(N)]
-        for n in range(N):
-            if args.binary_mask:
-                # for simplicity, mag_N > 0.5 * mag_mix
-                gt_masks[n] = (mags[n] > 0.5 * mag_mix).float()
-            else:
-                gt_masks[n] = mags[n] / mag_mix
-                # clamp to avoid large numbers in ratio masks
-                gt_masks[n].clamp_(0., 5.)
-
-        # LOG magnitude
-        log_mag_mix = torch.log(mag_mix).detach()
-
-        # 1. forward net_frame
-        feat_map_frames = [None for n in range(N)]
-        for n in range(N):
-            feat_map_frames[n] = self.net_frame.forward_multiframe(frames[n])
-
-        # 2. forward net_sound
-        pred_masks = [None for n in range(N)]
-        for n in range(N):
-            pred_masks[n] = self.net_sound.forward_test_stage(log_mag_mix,
-                                                              feat_map_frames[n],
-                                                              args.cycs_in_test)
-            pred_masks[n] = activate(pred_masks[n], args.output_activation)
-
-        # 3. loss
-        err_mask = self.crit(pred_masks, gt_masks, weight).reshape(1)
-
-        outputs = {'pred_masks': pred_masks, 'gt_masks': gt_masks,
-                   'mag_mix': mag_mix, 'mags': mags, 'weight': weight}
-
+        outputs = {'pred_masks': pred_masks, 'gt_masks': gt_masks, 'mag_mix': mag_mix, 'mags': mags}
         return err_mask, outputs
+
 
 
 def evaluate(netWrapper, loader, args):
