@@ -43,7 +43,7 @@ class BaseDataset(torchdata.Dataset):
         # initialize video transform
         self._init_vtransform()
 
-                # list_sample can be a python list or a csv file of list
+        # list_sample can be a python list or a csv file of list
         if isinstance(list_sample, str):
             self.list_sample = []
             for row in csv.reader(open(list_sample, 'r'), delimiter=','):
@@ -54,28 +54,24 @@ class BaseDataset(torchdata.Dataset):
             self.list_sample = list_sample
         else:
             raise ValueError("Error in list_sample format!")
-            
-            # Print debug info
-            print(f"[DEBUG] Process stage: {process_stage}")
-            print(f"[DEBUG] Initial samples in {list_sample}: {len(self.list_sample)}")
 
-            if process_stage == 'train':
-                self.list_sample *= opt.dup_trainset
-                random.shuffle(self.list_sample)
-            elif process_stage == 'val':
-                self.list_sample *= opt.dup_validset
-            else:
-                self.list_sample *= opt.dup_testset
+        # Duplication and shuffle for training/validation
+        if process_stage == 'train':
+            self.list_sample *= opt.dup_trainset
+            random.shuffle(self.list_sample)
+        elif process_stage == 'val':
+            self.list_sample *= opt.dup_validset
+        else:
+            self.list_sample *= opt.dup_testset
 
-            if max_sample > 0:
-                self.list_sample = self.list_sample[:max_sample]
+        if max_sample > 0:
+            self.list_sample = self.list_sample[:max_sample]
 
-            num_sample = len(self.list_sample)
-            print(f"[DEBUG] Number of samples after duplication and max_sample: {num_sample}")
-            if num_sample == 0:
-                raise AssertionError("No valid samples found in the dataset.")
-
-    # Rest of the __init__ code...
+        num_sample = len(self.list_sample)
+        print(f"[INFO] Process stage: {process_stage}")
+        print(f"[INFO] Number of samples after duplication: {num_sample}")
+        if num_sample == 0:
+            raise AssertionError("No valid samples found in the dataset.")
 
     def __len__(self):
         return len(self.list_sample)
@@ -107,74 +103,40 @@ class BaseDataset(torchdata.Dataset):
         return frames
 
     def _load_frame(self, path):
-        img = Image.open(path).convert('RGB')
-        return img
+        """
+        Load a video frame or return a dummy black frame with correct size.
+        """
+        if not os.path.exists(path):
+            print(f"[WARNING] Missing video frame: {path}. Using a dummy black frame.")
+            return Image.new("RGB", (self.imgSize, self.imgSize), color=(0, 0, 0))
+        try:
+            img = Image.open(path).convert('RGB')
+            return img
+        except Exception as e:
+            print(f"[ERROR] Failed to load frame {path}: {e}. Using a dummy black frame.")
+            return Image.new("RGB", (self.imgSize, self.imgSize), color=(0, 0, 0))
+
 
     def _stft(self, audio):
         spec = librosa.stft(audio, n_fft=self.stft_frame, hop_length=self.stft_hop)
         amp = np.abs(spec)
         phase = np.angle(spec)
         return torch.from_numpy(amp), torch.from_numpy(phase)
-   
-   
-   
-   
-    '''
-    def _load_audio(self, path, start_timestamp, nearest_resample=False):
 
-        # silent
-        if path.endswith('silent'):
-            return np.zeros(self.audLen, dtype=np.float32)
-
-        # load audio
-        audio_raw, rate = self._load_audio_file(path)
-
-        # repeat if audio is too short
-        if audio_raw.shape[0] < rate * self.audSec:
-            n = int(rate * self.audSec / audio_raw.shape[0]) + 1
-            audio_raw = np.tile(audio_raw, n)
-
-        # resample
-        if rate > self.audRate:
-            if nearest_resample:
-                audio_raw = audio_raw[::rate // self.audRate]
-            else:
-                audio_raw = librosa.resample(audio_raw, orig_sr=rate, target_sr=self.audRate)
-
-        # audio clip
-        start = int(start_timestamp * self.audRate)
-        end = start + self.audLen
-
-        return audio_raw[start:end]
-
-    def _load_audio_file(self, path):
-        if path.endswith('.mp3'):
-            audio_raw, rate = torchaudio.load(path)
-            audio_raw = audio_raw.numpy().astype(np.float32)
-
-            # convert to mono
-            if audio_raw.shape[0] == 2:
-                audio_raw = (audio_raw[0, :] + audio_raw[1, :]) / 2
-            else:
-                audio_raw = audio_raw[0, :]
-        else:
-            audio_raw, rate = librosa.load(path, sr=self.audRate, mono=True)
-
-        return audio_raw, rate 
-    '''
-
-    def _load_audio(self, path, start_timestamp, nearest_resample=False):
+    def _load_audio(self, path, start_timestamp):
+        """
+        Load audio data or return a silent placeholder with correct length.
+        """
         if not os.path.exists(path):
-            raise FileNotFoundError(f"Audio path does not exist: {path}")
-
-        if path.endswith('silent'):
+            print(f"[WARNING] Missing audio file: {path}. Using silent audio.")
             return np.zeros(self.audLen, dtype=np.float32)
-
-        # Load audio
         try:
-            audio_raw, rate = self._load_audio_file(path)
+            audio_raw, rate = librosa.load(path, sr=self.audRate, mono=True)
+            start = int(start_timestamp * self.audRate)
+            end = start + self.audLen
+            return audio_raw[start:end] if len(audio_raw) >= end else np.pad(audio_raw, (0, self.audLen - len(audio_raw)))
         except Exception as e:
-            print(f"Error loading audio from {path}: {e}")
+            print(f"[ERROR] Failed to load audio {path}: {e}. Using silent audio.")
             return np.zeros(self.audLen, dtype=np.float32)
 
         # Repeat if audio is too short
@@ -189,37 +151,16 @@ class BaseDataset(torchdata.Dataset):
             else:
                 audio_raw = librosa.resample(audio_raw, orig_sr=rate, target_sr=self.audRate)
 
-        # Audio clip
+        # Clip audio based on the start_timestamp
         start = int(start_timestamp * self.audRate)
         end = start + self.audLen
 
         if end > len(audio_raw):
             end = len(audio_raw)
-            start = max(0, end - self.audLen)  # Ensure we still return valid audio
+            start = max(0, end - self.audLen)  # Adjust start if end exceeds
 
         return audio_raw[start:end]
-
-    def _load_audio_file(self, path):
-        if not os.path.isfile(path):
-            raise FileNotFoundError(f"Audio file does not exist: {path}")
-
-        if path.endswith('.mp3'):
-            audio_raw, rate = torchaudio.load(path)
-            audio_raw = audio_raw.numpy().astype(np.float32)
-
-            # Convert to mono
-            if audio_raw.shape[0] == 2:
-                audio_raw = (audio_raw[0, :] + audio_raw[1, :]) / 2
-            else:
-                audio_raw = audio_raw[0, :]
-        else:
-            try:
-                audio_raw, rate = librosa.load(path, sr=self.audRate, mono=True)
-            except Exception as e:
-                raise RuntimeError(f"Failed to load audio file {path}: {e}")
-
-        return audio_raw, rate
-
+                    
     def __getitem__(self, index):
         sample = self.list_sample[index]
         N = len(sample) // 2
@@ -241,7 +182,7 @@ class BaseDataset(torchdata.Dataset):
         N = len(audios)
         mags = [None for n in range(N)]
 
-        # mix
+        # Mix audios
         audio_mix = np.asarray(audios).sum(axis=0) / N
 
         # STFT
@@ -250,7 +191,6 @@ class BaseDataset(torchdata.Dataset):
             ampN, _ = self._stft(audios[n])
             mags[n] = ampN.unsqueeze(0)
 
-        # to tensor
         for n in range(N):
             audios[n] = torch.from_numpy(audios[n])
 
